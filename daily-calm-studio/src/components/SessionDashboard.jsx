@@ -63,6 +63,15 @@ export default function SessionDashboard({
   async function handleReconnectFolder() {
     setFolderError(null)
     try {
+      // Try re-requesting permission on the existing handle first (requires user gesture)
+      if (folderHandle) {
+        const permission = await folderHandle.requestPermission({ mode: 'readwrite' })
+        if (permission === 'granted') {
+          scanDone(folderHandle)
+          return
+        }
+      }
+      // Fall back to picking a new folder
       const handle = await window.showDirectoryPicker({ mode: 'readwrite' })
       await saveFolderHandle(handle)
       setFolderHandle(handle)

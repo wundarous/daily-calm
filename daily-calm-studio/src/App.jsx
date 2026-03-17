@@ -22,14 +22,13 @@ export default function App() {
         return
       }
 
-      const permission = await handle.requestPermission({ mode: 'readwrite' })
-      if (permission === 'granted') {
-        setActiveMonth(month)
-        setFolderHandle(handle)
-        setAppState('dashboard')
-      } else {
-        setAppState('firstrun')
-      }
+      // queryPermission doesn't require a user gesture (requestPermission does)
+      const permission = await handle.queryPermission({ mode: 'readwrite' })
+      setActiveMonth(month)
+      setFolderHandle(handle)
+      setAppState('dashboard')
+      // If permission is 'prompt' or 'denied', the dashboard's Reconnect Folder
+      // button will handle re-requesting it with a proper user gesture.
     }
     init()
   }, [])
