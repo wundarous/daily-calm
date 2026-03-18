@@ -1,250 +1,227 @@
 import { useState, useEffect, useRef } from 'react'
-import { saveRecording } from '../lib/filesystem'
+import Webcam from 'react-webcam'
 import { buildFilename } from '../lib/slugify'
 
-function pickMimeType() {
-  const candidates = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm']
-  return candidates.find(t => MediaRecorder.isTypeSupported(t)) ?? ''
-}
-
-function formatTime(secs) {
-  const m = String(Math.floor(secs / 60)).padStart(2, '0')
-  const s = String(secs % 60).padStart(2, '0')
+const formatTime = (seconds) => {
+  const m = String(Math.floor(seconds / 60)).padStart(2, '0')
+  const s = String(seconds % 60).padStart(2, '0')
   return `${m}:${s}`
 }
 
-// State machine:
-//   requesting → idle → countdown → recording → stopped → saving → saved
-//   requesting → denied
-//   stopped → idle  (re-record)
-
 export default function CameraPanel({ video, folderHandle, onSaved }) {
-  const [cameraState, setCameraState] = useState('requesting')
-  const [countdown, setCountdown]     = useState(3)
-  const [elapsed, setElapsed]         = useState(0)
-  const [savedFilename, setSavedFilename] = useState(null)
-  const [saveError, setSaveError]     = useState(null)
+  const [recordingState, setRecordingState] = useState('idle')
+  const [countdown, setCountdown]           = useState(3)
+  const [elapsedSeconds, setElapsedSeconds] = useState(0)
+  const [previewUrl, setPreviewUrl]         = useState(null)
+  const [chunks, setChunks]                 = useState([])
+  const [permissionDenied, setPermissionDenied] = useState(false)
 
-  // Mirror of cameraState readable synchronously (avoids stale closure in key handler)
-  const stateRef     = useRef('requesting')
-  const liveRef      = useRef(null)
-  const playbackRef  = useRef(null)
-  const streamRef    = useRef(null)
-  const recorderRef  = useRef(null)
-  const chunksRef    = useRef([])
-  const blobRef      = useRef(null)
-  const timerRef     = useRef(null)
-  const countdownRef = useRef(null)
+  const webcamRef        = useRef(null)
+  const mediaRecorderRef = useRef(null)
+  const elapsedTimerRef  = useRef(null)
 
-  function setState(s) {
-    stateRef.current = s
-    setCameraState(s)
-  }
+  const shortTitle = video.title.replace(/^Daily Calm\s*[–—-]\s*/i, '')
 
-  // Start camera once on mount
+  // ── Assemble blob once all chunks are in and recorder is inactive ──────────
   useEffect(() => {
-    startCamera()
-    return stopCamera
-  }, [])
+    if (chunks.length === 0) return
+    if (mediaRecorderRef.current?.state !== 'inactive') return
+    const mimeType = mediaRecorderRef.current.mimeType || 'video/webm'
+    const blob = new Blob(chunks, { type: mimeType })
+    const url = URL.createObjectURL(blob)
+    setPreviewUrl(url)
+    setRecordingState('stopped')
+  }, [chunks])
 
-  // Space bar — read stateRef directly, never inside a setState updater
+  // ── Spacebar shortcut ──────────────────────────────────────────────────────
   useEffect(() => {
-    function onKey(e) {
+    const handleKey = (e) => {
       if (e.code !== 'Space') return
-      if (e.target.tagName === 'BUTTON' || e.target.tagName === 'INPUT') return
+      if (['INPUT', 'TEXTAREA'].includes(e.target.tagName)) return
       e.preventDefault()
-      const s = stateRef.current
-      if (s === 'idle') startCountdown()
-      else if (s === 'recording') stopRecording()
+      if (recordingState === 'idle')      handleStartClick()
+      if (recordingState === 'recording') stopRecording()
     }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [])
+    window.addEventListener('keydown', handleKey)
+    return () => window.removeEventListener('keydown', handleKey)
+  }, [recordingState])
 
-  async function startCamera() {
-    setState('requesting')
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true })
-      streamRef.current = stream
-      if (liveRef.current) liveRef.current.srcObject = stream
-      setState('idle')
-    } catch {
-      setState('denied')
-    }
-  }
-
-  function stopCamera() {
-    clearInterval(timerRef.current)
-    clearInterval(countdownRef.current)
-    streamRef.current?.getTracks().forEach(t => t.stop())
-  }
-
-  function startCountdown() {
-    // Guard: only start from idle
-    if (stateRef.current !== 'idle') return
-    setState('countdown')
+  // ── Countdown → start recording ────────────────────────────────────────────
+  const handleStartClick = () => {
     setCountdown(3)
+    setRecordingState('countdown')
     let count = 3
-    countdownRef.current = setInterval(() => {
+    const interval = setInterval(() => {
       count -= 1
-      if (count <= 0) {
-        clearInterval(countdownRef.current)
+      setCountdown(count)
+      if (count === 0) {
+        clearInterval(interval)
         startRecording()
-      } else {
-        setCountdown(count)
+        setRecordingState('recording')
       }
     }, 1000)
   }
 
-  function startRecording() {
-    chunksRef.current = []
-    blobRef.current = null
-    const mimeType = pickMimeType()
-    const recorder = new MediaRecorder(streamRef.current, mimeType ? { mimeType } : {})
-    recorder.ondataavailable = e => {
-      if (e.data.size > 0) chunksRef.current.push(e.data)
-    }
-    recorder.onstop = () => {
-      const blob = new Blob(chunksRef.current, { type: 'video/webm' })
-      blobRef.current = blob
-      if (playbackRef.current) {
-        if (playbackRef.current.src) URL.revokeObjectURL(playbackRef.current.src)
-        playbackRef.current.src = URL.createObjectURL(blob)
+  // ── Start recording ────────────────────────────────────────────────────────
+  const startRecording = () => {
+    setChunks([])
+    const stream = webcamRef.current.stream
+    const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp8,opus')
+      ? 'video/webm;codecs=vp8,opus'
+      : 'video/webm'
+
+    mediaRecorderRef.current = new MediaRecorder(stream, { mimeType })
+
+    mediaRecorderRef.current.ondataavailable = (e) => {
+      if (e.data.size > 0) {
+        setChunks(prev => [...prev, e.data])
       }
-      setState('stopped')
     }
-    recorder.start()
-    recorderRef.current = recorder
-    setElapsed(0)
-    setState('recording')
-    timerRef.current = setInterval(() => setElapsed(s => s + 1), 1000)
+
+    mediaRecorderRef.current.start()
+    setElapsedSeconds(0)
+    elapsedTimerRef.current = setInterval(() => {
+      setElapsedSeconds(s => s + 1)
+    }, 1000)
   }
 
-  function stopRecording() {
-    // Guard: only stop an actively recording recorder
-    if (recorderRef.current?.state !== 'recording') return
-    clearInterval(timerRef.current)
-    recorderRef.current.stop()
+  // ── Stop recording ─────────────────────────────────────────────────────────
+  const stopRecording = () => {
+    clearInterval(elapsedTimerRef.current)
+    if (mediaRecorderRef.current?.state === 'recording') {
+      mediaRecorderRef.current.stop()
+    }
   }
 
-  function reRecord() {
-    blobRef.current = null
-    setSaveError(null)
-    setElapsed(0)
-    setState('idle')
+  // ── Re-record ──────────────────────────────────────────────────────────────
+  const handleReRecord = () => {
+    if (previewUrl) URL.revokeObjectURL(previewUrl)
+    setPreviewUrl(null)
+    setChunks([])
+    setRecordingState('idle')
   }
 
-  async function handleSave() {
-    if (!blobRef.current || !folderHandle) return
-    const filename = buildFilename(video.date, video.title)
-    setSaveError(null)
-    setState('saving')
+  // ── Save ───────────────────────────────────────────────────────────────────
+  const handleSave = async () => {
+    if (!previewUrl || !folderHandle) return
+    setRecordingState('saving')
     try {
-      await saveRecording(folderHandle, filename, blobRef.current)
-      setSavedFilename(filename)
-      setState('saved')
+      const response = await fetch(previewUrl)
+      const blob = await response.blob()
+      const filename = buildFilename(video.date, video.title)
+      const fileHandle = await folderHandle.getFileHandle(filename, { create: true })
+      const writable = await fileHandle.createWritable()
+      await writable.write(blob)
+      await writable.close()
+      URL.revokeObjectURL(previewUrl)
+      setPreviewUrl(null)
+      setRecordingState('saved')
       setTimeout(() => onSaved(), 1500)
-    } catch {
-      setSaveError('Save failed. Check folder permissions and try again.')
-      setState('stopped')
+    } catch (err) {
+      console.error('Save failed:', err)
+      setRecordingState('stopped')
     }
   }
 
-  const showLive = !['stopped', 'saving', 'saved'].includes(cameraState)
+  // ── Permission denied ──────────────────────────────────────────────────────
+  if (permissionDenied) {
+    return (
+      <div className="flex flex-col h-full p-6 items-center justify-center text-center">
+        <p className="text-stone-400 text-sm mb-2">Camera or microphone access was denied.</p>
+        <p className="text-stone-500 text-xs mb-5">Allow access in your browser settings and reload the page.</p>
+        <button
+          onClick={() => window.location.reload()}
+          className="px-4 py-2 rounded-lg bg-stone-700 text-white text-sm hover:bg-stone-600 transition-colors"
+        >
+          Retry
+        </button>
+      </div>
+    )
+  }
 
-  // Strip "Daily Calm – " prefix for the compact overlay label
-  const shortTitle = video.title.replace(/^Daily Calm\s*[–—-]\s*/i, '')
+  const showWebcam = recordingState !== 'stopped' && recordingState !== 'saving' && recordingState !== 'saved'
 
+  // ── Render ─────────────────────────────────────────────────────────────────
   return (
     <div className="flex flex-col h-full p-6">
 
-      {/* Preview area */}
-      <div className="relative flex-1 bg-black rounded-2xl overflow-hidden mb-5 min-h-0">
+      {/* ── Video area ── */}
+      <div className="relative flex-1 min-h-0 bg-black rounded-2xl overflow-hidden mb-5">
 
-        {/* Live feed */}
-        <video
-          ref={liveRef}
-          autoPlay
-          muted
-          playsInline
-          className={`w-full h-full object-cover ${showLive ? '' : 'hidden'}`}
-        />
+        {/* Live webcam preview */}
+        {showWebcam && (
+          <Webcam
+            ref={webcamRef}
+            audio={true}
+            muted={true}
+            playsInline
+            videoConstraints={{ width: 1280, height: 720, facingMode: 'user' }}
+            onUserMediaError={() => setPermissionDenied(true)}
+            style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+          />
+        )}
 
-        {/* Playback after stop */}
-        <video
-          ref={playbackRef}
-          controls
-          playsInline
-          className={`w-full h-full object-cover ${!showLive ? '' : 'hidden'}`}
-        />
+        {/* Playback preview */}
+        {recordingState === 'stopped' && previewUrl && (
+          <video
+            src={previewUrl}
+            controls
+            style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+          />
+        )}
 
-        {/* Notes overlay — visible during live feed only, not during playback */}
-        {showLive && cameraState !== 'requesting' && cameraState !== 'denied' && (
-          <div className="absolute bottom-0 inset-x-0 px-5 py-4"
+        {/* Notes overlay — live states only */}
+        {showWebcam && (
+          <div
+            className="absolute bottom-0 inset-x-0 px-5 py-4 pointer-events-none"
             style={{ background: 'linear-gradient(to top, rgba(0,0,0,0.72) 0%, transparent 100%)' }}
           >
             <div className="text-white font-semibold text-base leading-snug">{shortTitle}</div>
-            <div className="text-stone-300 text-sm mt-0.5">{video.technique} · {video.technique_category}</div>
+            <div className="text-stone-300 text-sm mt-0.5">
+              {video.technique} · {video.technique_category}
+            </div>
           </div>
         )}
 
         {/* Countdown overlay */}
-        {cameraState === 'countdown' && (
-          <div className="absolute inset-0 flex items-center justify-center bg-black/50 pointer-events-none">
-            <span className="text-white font-bold select-none" style={{ fontSize: '10rem', lineHeight: 1 }}>
-              {countdown}
-            </span>
+        {recordingState === 'countdown' && (
+          <div style={{
+            position: 'absolute', inset: 0,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            fontSize: '8rem', fontWeight: 'bold', color: 'white',
+            backgroundColor: 'rgba(0,0,0,0.4)',
+          }}>
+            {countdown}
           </div>
         )}
 
-        {/* Recording dot + timer */}
-        {cameraState === 'recording' && (
+        {/* Recording indicator */}
+        {recordingState === 'recording' && (
           <div className="absolute top-4 left-4 flex items-center gap-2 bg-black/40 px-3 py-1.5 rounded-full">
             <span className="w-2.5 h-2.5 rounded-full bg-red-500 animate-pulse" />
-            <span className="text-white text-sm font-mono">{formatTime(elapsed)}</span>
-          </div>
-        )}
-
-        {/* Denied */}
-        {cameraState === 'denied' && (
-          <div className="absolute inset-0 flex flex-col items-center justify-center text-center p-8">
-            <p className="text-stone-400 mb-2 text-sm">Camera or microphone access was denied.</p>
-            <p className="text-stone-600 text-xs mb-5">Check your browser permissions and try again.</p>
-            <button
-              onClick={startCamera}
-              className="px-4 py-2 rounded-lg bg-stone-700 text-white text-sm hover:bg-stone-600 transition-colors"
-            >
-              Retry
-            </button>
-          </div>
-        )}
-
-        {/* Requesting */}
-        {cameraState === 'requesting' && (
-          <div className="absolute inset-0 flex items-center justify-center">
-            <p className="text-stone-500 text-sm">Starting camera…</p>
+            <span className="text-white text-sm font-mono">{formatTime(elapsedSeconds)}</span>
           </div>
         )}
       </div>
 
-      {/* Controls */}
+      {/* ── Controls ── */}
       <div className="flex-shrink-0 flex flex-col items-center gap-3">
         <div className="flex items-center justify-center gap-3 h-10">
 
-          {cameraState === 'idle' && (
+          {recordingState === 'idle' && (
             <button
-              onClick={startCountdown}
+              onClick={handleStartClick}
               className="px-6 py-2.5 rounded-xl bg-calm-accent text-white font-medium hover:bg-purple-600 transition-colors"
             >
               ▶ Start Recording
             </button>
           )}
 
-          {cameraState === 'countdown' && (
+          {recordingState === 'countdown' && (
             <span className="text-stone-500 text-sm">Get ready…</span>
           )}
 
-          {cameraState === 'recording' && (
+          {recordingState === 'recording' && (
             <button
               onClick={stopRecording}
               className="px-6 py-2.5 rounded-xl bg-red-600 text-white font-medium hover:bg-red-700 transition-colors"
@@ -253,10 +230,10 @@ export default function CameraPanel({ video, folderHandle, onSaved }) {
             </button>
           )}
 
-          {cameraState === 'stopped' && (
+          {recordingState === 'stopped' && (
             <>
               <button
-                onClick={reRecord}
+                onClick={handleReRecord}
                 className="px-4 py-2 rounded-xl border border-stone-700 text-stone-300 text-sm hover:border-stone-500 hover:text-white transition-colors"
               >
                 ↺ Re-record
@@ -265,12 +242,12 @@ export default function CameraPanel({ video, folderHandle, onSaved }) {
                 onClick={handleSave}
                 className="px-5 py-2 rounded-xl bg-calm-accent text-white font-medium text-sm hover:bg-purple-600 transition-colors"
               >
-                Save
+                💾 Save
               </button>
             </>
           )}
 
-          {cameraState === 'saving' && (
+          {recordingState === 'saving' && (
             <div className="flex items-center gap-2 text-stone-400 text-sm">
               <svg className="animate-spin w-4 h-4" viewBox="0 0 24 24" fill="none">
                 <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
@@ -280,20 +257,16 @@ export default function CameraPanel({ video, folderHandle, onSaved }) {
             </div>
           )}
 
-          {cameraState === 'saved' && (
+          {recordingState === 'saved' && (
             <div className="text-green-400 text-sm font-medium">
-              ✓ Saved as {savedFilename}
+              ✓ Saved as {buildFilename(video.date, video.title)}
             </div>
           )}
         </div>
 
-        {saveError && (
-          <p className="text-red-400 text-xs text-center">{saveError}</p>
-        )}
-
-        {(cameraState === 'idle' || cameraState === 'recording') && (
+        {(recordingState === 'idle' || recordingState === 'recording') && (
           <p className="text-stone-700 text-xs">
-            Space to {cameraState === 'idle' ? 'start' : 'stop'}
+            Space to {recordingState === 'idle' ? 'start' : 'stop'}
           </p>
         )}
       </div>
