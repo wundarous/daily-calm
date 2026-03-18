@@ -170,14 +170,14 @@ export default function CameraPanel({ video, folderHandle, onSaved }) {
           />
         )}
 
-        {/* Notes overlay — live states only */}
-        {showWebcam && (
+        {/* Notes overlay — idle and countdown only */}
+        {recordingState === 'idle' && (
           <div
-            className="absolute bottom-0 inset-x-0 px-5 py-4 pointer-events-none"
-            style={{ background: 'linear-gradient(to top, rgba(0,0,0,0.72) 0%, transparent 100%)' }}
+            className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none"
+            style={{ backgroundColor: 'rgba(0,0,0,0.45)' }}
           >
-            <div className="text-white font-semibold text-base leading-snug">{shortTitle}</div>
-            <div className="text-stone-300 text-sm mt-0.5">
+            <div className="text-white font-bold text-3xl leading-tight text-center px-8">{shortTitle}</div>
+            <div className="text-stone-300 text-lg mt-3 text-center">
               {video.technique} · {video.technique_category}
             </div>
           </div>
